@@ -6,6 +6,7 @@ import {
 import { fixAndValidateStructuredOutput } from 'react-native-executorch';
 import type { z } from 'zod';
 import { useOnDeviceAI } from './OnDeviceAIProvider';
+import { splitSaveUtterance } from './splitSaveUtterance';
 
 const MAX_SESSION_DURATION_MS = 60000;
 const COMMAND_STATUS_DISPLAY_MS = 2500;
@@ -204,7 +205,7 @@ export function useVoiceAgent<T>(options: UseVoiceAgentOptions<T>) {
         return;
       }
 
-      utteranceQueueRef.current.push(input);
+      utteranceQueueRef.current.push(...splitSaveUtterance(input));
 
       if (isProcessingQueueRef.current) {
         const pending = utteranceQueueRef.current.length;
