@@ -54,6 +54,19 @@ describe('applyStockAction', () => {
     expect(next).toEqual(emptyStockDraft);
   });
 
+  it('applies SET_NAME when INCOMPLETE is in the same array', () => {
+    const next = applyStockAction(emptyStockDraft, [
+      { action: ActionName.SET_NAME, name: 'cheese' },
+      { action: ActionName.INCOMPLETE },
+    ]);
+    expect(next).toEqual({
+      name: 'cheese',
+      quantity: null,
+      costPrice: null,
+      sellingPrice: null,
+    });
+  });
+
   it('does not change the draft for SAVE', () => {
     const draft = { name: 'pens', quantity: 10, costPrice: 20, sellingPrice: 35 };
     expect(isSaveStockAction([{ action: ActionName.SAVE }])).toBe(true);

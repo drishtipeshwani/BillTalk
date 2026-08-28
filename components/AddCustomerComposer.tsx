@@ -12,7 +12,8 @@ import {
 import type { CustomerDraft, CustomerLedgerEntry } from '../types/ledger';
 import { emptyCustomerDraft } from '../types/ledger';
 import {
-  CustomerAgentActionResponseSchema,
+  ActionName,
+  CustomerActionSchema,
   type CustomerAgentActionResponse,
 } from '../types/agentActionResponse';
 import { useAuth } from '../utils/authContext';
@@ -119,11 +120,18 @@ export default function AddCustomerComposer({
     clearAgentContext,
     showStatus,
   } = useVoiceAgent({
-    schema: CustomerAgentActionResponseSchema,
+    itemSchema: CustomerActionSchema,
     getSystemPrompt: () => CUSTOMER_SYSTEM_PROMPT_SHORT,
     applyResponse,
     isIncomplete: isIncompleteCustomerAction,
     isUnknown: isUnknownCustomerAction,
+    getAssistantContext: () => {
+      const name = draftRef.current.name.trim();
+      if (!name) {
+        return null;
+      }
+      return [{ action: ActionName.SET_NAME, name }];
+    },
   });
 
   const handleCancel = () => {

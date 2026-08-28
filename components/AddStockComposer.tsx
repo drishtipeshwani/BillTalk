@@ -12,7 +12,8 @@ import {
 import type { StockDraft, StockItem } from '../types/stock';
 import { emptyStockDraft } from '../types/stock';
 import {
-  StockAgentActionResponseSchema,
+  ActionName,
+  StockActionSchema,
   type StockAgentActionResponse,
 } from '../types/agentActionResponse';
 import { useAuth } from '../utils/authContext';
@@ -127,11 +128,18 @@ export default function AddStockComposer({
     clearAgentContext,
     showStatus,
   } = useVoiceAgent({
-    schema: StockAgentActionResponseSchema,
+    itemSchema: StockActionSchema,
     getSystemPrompt: () => STOCK_SYSTEM_PROMPT_SHORT,
     applyResponse,
     isIncomplete: isIncompleteStockAction,
     isUnknown: isUnknownStockAction,
+    getAssistantContext: () => {
+      const name = draftRef.current.name.trim();
+      if (!name) {
+        return null;
+      }
+      return [{ action: ActionName.SET_NAME, name }];
+    },
   });
 
   const handleCancel = () => {

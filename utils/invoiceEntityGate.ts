@@ -8,7 +8,7 @@ import {
   applySingleInvoiceAction,
   invoiceHasItem,
 } from './applyInvoiceAction';
-import { normalizeEntityName } from './entityName';
+import { fuzzyMatchEntityName, normalizeEntityName } from './entityName';
 
 export type CatalogKind = 'customer' | 'stock';
 
@@ -79,30 +79,91 @@ export function catalogRequirement(
   }
 }
 
+export interface CatalogLookup {
+  customerExists: (name: string) => Promise<boolean>;
+  stockItemExists: (name: string) => Promise<boolean>;
+  customerNames?: () => Promise<string[]>;
+  stockNames?: () => Promise<string[]>;
+}
+
+export function rewriteActionEntityName(action: Action, name: string): Action {
+  switch (action.action) {
+    case ActionName.SET_CUSTOMER:
+      return { ...action, customerName: name };
+    case ActionName.ADD_ITEM:
+    case ActionName.DELETE_ITEM:
+    case ActionName.SET_PRICE:
+    case ActionName.SET_QUANTITY:
+    case ActionName.SET_ITEM_DISCOUNT:
+      return { ...action, name };
+    case ActionName.RENAME_ITEM:
+      return { ...action, updatedItemName: name };
+    default:
+      return action;
+  }
+}
+
+async function resolveCatalogName(
+  invoice: Invoice,
+  kind: CatalogKind,
+  spoken: string,
+  lookup: CatalogLookup,
+  namesCache: { customer: string[] | null; stock: string[] | null },
+): Promise<string> {
+  if (kind === 'customer') {
+    if (!namesCache.customer && lookup.customerNames) {
+      namesCache.customer = await lookup.customerNames();
+    }
+    return fuzzyMatchEntityName(spoken, namesCache.customer ?? []) ?? spoken;
+  }
+
+  const invoiceNames = invoice.items.map((item) => item.name).filter(Boolean);
+  if (!namesCache.stock && lookup.stockNames) {
+    namesCache.stock = await lookup.stockNames();
+  }
+  return (
+    fuzzyMatchEntityName(spoken, [
+      ...invoiceNames,
+      ...(namesCache.stock ?? []),
+    ]) ?? spoken
+  );
+}
+
 export async function processGatedInvoiceActions(
   invoice: Invoice,
   actions: AgentActionResponse,
-  lookup: {
-    customerExists: (name: string) => Promise<boolean>;
-    stockItemExists: (name: string) => Promise<boolean>;
-  },
+  lookup: CatalogLookup,
 ): Promise<GatedApplyResult> {
   let next = invoice;
   let changed = false;
   const applied: Action[] = [];
+  const namesCache: { customer: string[] | null; stock: string[] | null } = {
+    customer: null,
+    stock: null,
+  };
 
   for (let index = 0; index < actions.length; index += 1) {
-    const action = rewriteCompanyAsCustomer(actions[index]);
+    let action = rewriteCompanyAsCustomer(actions[index]);
     if (action.action === ActionName.SAVE_INVOICE) {
       continue;
     }
 
     const requirement = catalogRequirement(next, action);
     if (requirement) {
+      const resolvedName = await resolveCatalogName(
+        next,
+        requirement.kind,
+        requirement.name,
+        lookup,
+        namesCache,
+      );
+      if (resolvedName !== requirement.name) {
+        action = rewriteActionEntityName(action, resolvedName);
+      }
       const exists =
         requirement.kind === 'customer'
-          ? await lookup.customerExists(requirement.name)
-          : await lookup.stockItemExists(requirement.name);
+          ? await lookup.customerExists(resolvedName)
+          : await lookup.stockItemExists(resolvedName);
       if (!exists) {
         return {
           invoice: next,
@@ -110,11 +171,57 @@ export async function processGatedInvoiceActions(
           applied,
           prompt: {
             kind: requirement.kind,
-            name: requirement.name,
+            name: resolvedName,
             action,
             remaining: actions.slice(index + 1).map(rewriteCompanyAsCustomer),
           },
         };
+      }
+    } else if (
+      action.action === ActionName.DELETE_ITEM ||
+      action.action === ActionName.SET_PRICE ||
+      action.action === ActionName.SET_QUANTITY ||
+      action.action === ActionName.SET_ITEM_DISCOUNT
+    ) {
+      const spoken = normalizeEntityName(action.name);
+      if (spoken) {
+        const resolvedName = await resolveCatalogName(
+          next,
+          'stock',
+          spoken,
+          lookup,
+          namesCache,
+        );
+        if (resolvedName !== spoken) {
+          action = rewriteActionEntityName(action, resolvedName);
+        }
+      }
+    } else if (action.action === ActionName.RENAME_ITEM) {
+      const fromName = normalizeEntityName(action.name);
+      if (fromName) {
+        const resolvedFrom = await resolveCatalogName(
+          next,
+          'stock',
+          fromName,
+          lookup,
+          namesCache,
+        );
+        if (resolvedFrom !== fromName) {
+          action = { ...action, name: resolvedFrom };
+        }
+      }
+      const toName = normalizeEntityName(action.updatedItemName);
+      if (toName) {
+        const resolvedTo = await resolveCatalogName(
+          next,
+          'stock',
+          toName,
+          lookup,
+          namesCache,
+        );
+        if (resolvedTo !== toName) {
+          action = { ...action, updatedItemName: resolvedTo };
+        }
       }
     }
 

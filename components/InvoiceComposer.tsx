@@ -17,7 +17,8 @@ import SaveButton from './SaveButton';
 import { emptyInvoice } from '../data/emptyInvoice';
 import { Invoice } from '../types/invoice';
 import {
-  AgentActionResponseSchema,
+  ActionName,
+  ActionSchema,
   type Action,
   type AgentActionResponse,
 } from '../types/agentActionResponse';
@@ -25,6 +26,8 @@ import {
   SaveInvoiceError,
   customerExists,
   getInvoiceById,
+  listCustomers,
+  listStockItems,
   saveInvoice,
   stockItemExists,
   updateInvoice,
@@ -134,6 +137,10 @@ export default function InvoiceComposer({
         user ? customerExists(db, user.id, name) : false,
       stockItemExists: async (name: string) =>
         user ? stockItemExists(db, user.id, name) : false,
+      customerNames: async () =>
+        user ? (await listCustomers(db, user.id)).map((row) => row.name) : [],
+      stockNames: async () =>
+        user ? (await listStockItems(db, user.id)).map((row) => row.name) : [],
     }),
     [db, user],
   );
@@ -256,11 +263,21 @@ export default function InvoiceComposer({
     clearAgentContext,
     showStatus,
   } = useVoiceAgent({
-    schema: AgentActionResponseSchema,
+    itemSchema: ActionSchema,
     getSystemPrompt: () => INVOICE_SYSTEM_PROMPT_SHORT,
     applyResponse,
     isIncomplete: isIncompleteInvoiceAction,
     isUnknown: isUnknownInvoiceAction,
+    getAssistantContext: () => {
+      const items = invoiceRef.current.items;
+      for (let index = items.length - 1; index >= 0; index -= 1) {
+        const name = items[index]?.name.trim();
+        if (name) {
+          return [{ action: ActionName.ADD_ITEM, name }];
+        }
+      }
+      return null;
+    },
   });
 
   useEffect(() => {

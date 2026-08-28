@@ -29,6 +29,37 @@ function replaceItem(invoice: Invoice, index: number, item: InvoiceItem): Invoic
   };
 }
 
+function mergeItemFields(base: InvoiceItem, patch: Partial<InvoiceItem>): InvoiceItem {
+  return {
+    ...base,
+    ...patch,
+    name: patch.name ?? base.name,
+  };
+}
+
+function collapseDuplicateItems(invoice: Invoice): Invoice {
+  const unique: InvoiceItem[] = [];
+  for (const item of invoice.items) {
+    const index = unique.findIndex((existing) =>
+      entityNamesMatch(existing.name, item.name),
+    );
+    if (index === -1) {
+      unique.push(item);
+      continue;
+    }
+    unique[index] = mergeItemFields(unique[index], {
+      quantity: item.quantity ?? unique[index].quantity,
+      pricePerItem: item.pricePerItem ?? unique[index].pricePerItem,
+      discountPercent: item.discountPercent ?? unique[index].discountPercent,
+      discountAmount: item.discountAmount ?? unique[index].discountAmount,
+    });
+  }
+  if (unique.length === invoice.items.length) {
+    return invoice;
+  }
+  return { ...invoice, items: unique };
+}
+
 function upsertItem(
   invoice: Invoice,
   name: string,
@@ -45,28 +76,29 @@ function upsertItem(
       ],
     };
   }
-  return replaceItem(invoice, index, {
-    ...invoice.items[index],
-    ...patch,
-  });
+  return replaceItem(invoice, index, mergeItemFields(invoice.items[index], patch));
 }
 
 function applyOneAction(invoice: Invoice, action: Action): Invoice | null {
   switch (action.action) {
-    case ActionName.ADD_ITEM:
-      return {
-        ...invoice,
-        items: [
-          ...invoice.items,
-          {
-            name: normalizeEntityName(action.name),
-            quantity: action.quantity ?? null,
-            pricePerItem: action.pricePerItem ?? null,
-            discountPercent: action.discountPercent ?? null,
-            discountAmount: action.discountAmount ?? null,
-          },
-        ],
-      };
+    case ActionName.ADD_ITEM: {
+      const patch: Partial<InvoiceItem> = {};
+      if (action.quantity !== undefined) {
+        patch.quantity = action.quantity;
+      }
+      if (action.pricePerItem !== undefined) {
+        patch.pricePerItem = action.pricePerItem;
+      }
+      if (action.discountPercent !== undefined) {
+        patch.discountPercent = action.discountPercent;
+        patch.discountAmount = null;
+      }
+      if (action.discountAmount !== undefined) {
+        patch.discountAmount = action.discountAmount;
+        patch.discountPercent = null;
+      }
+      return upsertItem(invoice, action.name, patch);
+    }
 
     case ActionName.DELETE_ITEM: {
       const index = findItemIndex(invoice, action.name);
@@ -85,10 +117,34 @@ function applyOneAction(invoice: Invoice, action: Action): Invoice | null {
     case ActionName.SET_QUANTITY:
       return upsertItem(invoice, action.name, { quantity: action.quantity });
 
-    case ActionName.RENAME_ITEM:
-      return upsertItem(invoice, action.name, {
-        name: normalizeEntityName(action.updatedItemName),
+    case ActionName.RENAME_ITEM: {
+      const nextName = normalizeEntityName(action.updatedItemName);
+      const sourceIndex = findItemIndex(invoice, action.name);
+      if (sourceIndex === -1) {
+        return upsertItem(invoice, action.name, { name: nextName });
+      }
+      const destIndex = findItemIndex(invoice, nextName);
+      if (destIndex !== -1 && destIndex !== sourceIndex) {
+        const dest = invoice.items[destIndex];
+        const source = invoice.items[sourceIndex];
+        const merged = mergeItemFields(dest, {
+          quantity: dest.quantity ?? source.quantity,
+          pricePerItem: dest.pricePerItem ?? source.pricePerItem,
+          discountPercent: dest.discountPercent ?? source.discountPercent,
+          discountAmount: dest.discountAmount ?? source.discountAmount,
+        });
+        return {
+          ...invoice,
+          items: invoice.items
+            .map((item, i) => (i === destIndex ? merged : item))
+            .filter((_, i) => i !== sourceIndex),
+        };
+      }
+      return replaceItem(invoice, sourceIndex, {
+        ...invoice.items[sourceIndex],
+        name: nextName,
       });
+    }
 
     case ActionName.SET_ITEM_DISCOUNT:
       if ('discountPercent' in action) {
@@ -154,7 +210,8 @@ export function applySingleInvoiceAction(
   if (action.action === ActionName.SAVE_INVOICE) {
     return null;
   }
-  return applyOneAction(invoice, action);
+  const next = applyOneAction(invoice, action);
+  return next ? collapseDuplicateItems(next) : null;
 }
 
 export function isIncompleteInvoiceAction(response: AgentActionResponse): boolean {

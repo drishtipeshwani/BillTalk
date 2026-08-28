@@ -106,6 +106,71 @@ describe('processGatedInvoiceActions', () => {
     expect(result.invoice.items[0]?.name).toBe('pens');
   });
 
+  it('keeps one row when ADD_ITEM repeats a catalog name', async () => {
+    const result = await processGatedInvoiceActions(
+      invoice,
+      [
+        { action: ActionName.ADD_ITEM, name: 'pens', quantity: 1 },
+        { action: ActionName.ADD_ITEM, name: 'Pens', pricePerItem: 10 },
+      ],
+      {
+        customerExists: async () => true,
+        stockItemExists: async () => true,
+      },
+    );
+
+    expect(result.prompt).toBeNull();
+    expect(result.invoice.items).toHaveLength(1);
+    expect(result.invoice.items[0]).toMatchObject({
+      name: 'pens',
+      quantity: 1,
+      pricePerItem: 10,
+    });
+  });
+
+  it('applies each SET_PRICE independently when both items exist', async () => {
+    const withItems: Invoice = {
+      ...invoice,
+      items: [
+        {
+          name: 'greek yoghurt',
+          quantity: 10,
+          pricePerItem: null,
+          discountPercent: null,
+          discountAmount: null,
+        },
+        {
+          name: 'protein bar',
+          quantity: 5,
+          pricePerItem: null,
+          discountPercent: null,
+          discountAmount: null,
+        },
+      ],
+    };
+
+    const result = await processGatedInvoiceActions(
+      withItems,
+      [
+        { action: ActionName.SET_PRICE, name: 'greek yoghurt', pricePerItem: 50 },
+        { action: ActionName.DELETE_ITEM, name: 'missing item' },
+        { action: ActionName.SET_PRICE, name: 'protein bar', pricePerItem: 20 },
+      ],
+      {
+        customerExists: async () => true,
+        stockItemExists: async () => true,
+      },
+    );
+
+    expect(result.prompt).toBeNull();
+    expect(result.invoice.items[0]?.pricePerItem).toBe(50);
+    expect(result.invoice.items[1]?.pricePerItem).toBe(20);
+    expect(result.applied).toEqual([
+      { action: ActionName.SET_PRICE, name: 'greek yoghurt', pricePerItem: 50 },
+      { action: ActionName.SET_PRICE, name: 'protein bar', pricePerItem: 20 },
+    ]);
+  });
+
   it('treats SET_COMPANY as SET_CUSTOMER', async () => {
     const result = await processGatedInvoiceActions(
       invoice,
@@ -121,21 +186,33 @@ describe('processGatedInvoiceActions', () => {
     expect(result.invoice.companyName).toBe('Shop');
   });
 
-  it('prompts to create a customer when SET_COMPANY names a missing party', async () => {
+  it('rewrites a spoken stock name to the catalog spelling', async () => {
     const result = await processGatedInvoiceActions(
       invoice,
-      [{ action: ActionName.SET_COMPANY, companyName: 'Achi Enterprises' }],
+      [{ action: ActionName.ADD_ITEM, name: 'yoghurt' }],
       {
-        customerExists: async () => false,
-        stockItemExists: async () => true,
+        customerExists: async () => true,
+        stockItemExists: async (name) => name === 'Yogurt',
+        stockNames: async () => ['Yogurt'],
       },
     );
 
-    expect(result.invoice.companyName).toBe('Shop');
-    expect(result.prompt).toMatchObject({
-      kind: 'customer',
-      name: 'Achi Enterprises',
-      action: { action: ActionName.SET_CUSTOMER, customerName: 'Achi Enterprises' },
-    });
+    expect(result.prompt).toBeNull();
+    expect(result.invoice.items[0]?.name).toBe('Yogurt');
+  });
+
+  it('rewrites a spoken customer name to the ledger spelling', async () => {
+    const result = await processGatedInvoiceActions(
+      invoice,
+      [{ action: ActionName.SET_CUSTOMER, customerName: 'Rames' }],
+      {
+        customerExists: async (name) => name === 'Ramesh',
+        stockItemExists: async () => true,
+        customerNames: async () => ['Ramesh'],
+      },
+    );
+
+    expect(result.prompt).toBeNull();
+    expect(result.invoice.customerName).toBe('Ramesh');
   });
 });

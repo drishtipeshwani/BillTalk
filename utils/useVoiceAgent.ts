@@ -4,9 +4,26 @@ import {
   useSpeechRecognitionEvent,
 } from 'expo-speech-recognition';
 import { fixAndValidateStructuredOutput } from 'react-native-executorch';
-import type { z } from 'zod';
+import { z } from 'zod';
+import {
+  buildCommandLatencySample,
+  recordCommandLatency,
+} from './commandLatency';
 import { useOnDeviceAI } from './OnDeviceAIProvider';
+import { parseValidActions } from './parseAgentActions';
 import { splitSaveUtterance } from './splitSaveUtterance';
+import { TRANSCRIPT_CHUNK_INTERVAL_MS } from './transcriptDelta';
+import {
+  flushPendingAction,
+  ingestPendingAction,
+  isActionItem,
+  isActionList,
+} from './actionHypothesis';
+
+interface QueuedUtterance {
+  text: string;
+  finalize: boolean;
+}
 
 const MAX_SESSION_DURATION_MS = 60000;
 const COMMAND_STATUS_DISPLAY_MS = 2500;
@@ -22,17 +39,19 @@ export interface VoiceAgentApplyResult {
   updateContext?: boolean;
 }
 
-interface UseVoiceAgentOptions<T> {
-  schema: z.ZodType<T>;
+interface UseVoiceAgentOptions<TItem> {
+  itemSchema: z.ZodType<TItem>;
   getSystemPrompt: () => string;
   applyResponse: (
-    response: T,
+    response: TItem[],
   ) => VoiceAgentApplyResult | null | Promise<VoiceAgentApplyResult | null>;
-  isIncomplete: (response: T) => boolean;
-  isUnknown: (response: T) => boolean;
+  isIncomplete: (response: TItem[]) => boolean;
+  isUnknown: (response: TItem[]) => boolean;
+  /** Current draft/item identity to send as previous-assistant JSON. */
+  getAssistantContext?: () => TItem[] | null;
 }
 
-export function useVoiceAgent<T>(options: UseVoiceAgentOptions<T>) {
+export function useVoiceAgent<TItem>(options: UseVoiceAgentOptions<TItem>) {
   const { llm } = useOnDeviceAI();
 
   const [isSessionActive, setIsSessionActive] = useState(false);
@@ -42,12 +61,17 @@ export function useVoiceAgent<T>(options: UseVoiceAgentOptions<T>) {
 
   const sessionActiveRef = useRef(false);
   const committedTextRef = useRef('');
+  const interimTranscriptRef = useRef('');
+  const chunkTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
   const safetyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const commandStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const llmRef = useRef(llm);
-  const utteranceQueueRef = useRef<string[]>([]);
+  const utteranceQueueRef = useRef<QueuedUtterance[]>([]);
   const isProcessingQueueRef = useRef(false);
-  const lastSuccessfulAgentResponseRef = useRef<T | null>(null);
+  const lastSuccessfulAgentResponseRef = useRef<TItem[] | null>(null);
+  const lastLlmUtteranceRef = useRef('');
+  const pendingActionRef = useRef<TItem | null>(null);
+  const appliedActionsRef = useRef<TItem[]>([]);
   const optionsRef = useRef(options);
 
   useEffect(() => {
@@ -82,16 +106,28 @@ export function useVoiceAgent<T>(options: UseVoiceAgentOptions<T>) {
 
   const clearTranscript = useCallback(() => {
     committedTextRef.current = '';
+    interimTranscriptRef.current = '';
     setHeardText('');
+  }, []);
+
+  const currentUtterance = useCallback(() => {
+    return interimTranscriptRef.current.trim();
   }, []);
 
   const clearUtteranceQueue = useCallback(() => {
     utteranceQueueRef.current = [];
   }, []);
 
+  const clearHypothesis = useCallback(() => {
+    lastLlmUtteranceRef.current = '';
+    pendingActionRef.current = null;
+    appliedActionsRef.current = [];
+  }, []);
+
   const clearAgentContext = useCallback(() => {
     lastSuccessfulAgentResponseRef.current = null;
-  }, []);
+    clearHypothesis();
+  }, [clearHypothesis]);
 
   const scheduleCommandStatusClear = useCallback(() => {
     if (commandStatusTimerRef.current) {
@@ -111,63 +147,134 @@ export function useVoiceAgent<T>(options: UseVoiceAgentOptions<T>) {
   );
 
   const processUtterance = useCallback(
-    async (input: string) => {
+    async (queued: QueuedUtterance) => {
       const currentLlm = llmRef.current;
       if (!currentLlm.isReady) {
         return;
       }
 
-      console.log('[LLM] utterance:', input);
+      const utterance = queued.text.trim();
+      const {
+        itemSchema,
+        getSystemPrompt,
+        applyResponse,
+        isIncomplete,
+        isUnknown,
+      } = optionsRef.current;
 
-      try {
-        setCommandStatus({ message: 'Running on-device LLM…', isError: false });
-
-        const { schema, getSystemPrompt, applyResponse, isIncomplete, isUnknown } =
-          optionsRef.current;
-        const lastAgentResponse = lastSuccessfulAgentResponseRef.current;
-        const messages = [
-          { role: 'system' as const, content: getSystemPrompt() },
-          ...(lastAgentResponse
-            ? [
-                {
-                  role: 'assistant' as const,
-                  content: JSON.stringify(lastAgentResponse),
-                },
-              ]
-            : []),
-          { role: 'user' as const, content: input },
-        ];
-        const reply = await currentLlm.generate(messages);
-        console.log('[LLM] response:', reply);
-        const formattedResponse = fixAndValidateStructuredOutput(reply, schema);
-
-        if (!formattedResponse) {
-          showStatus('Could not parse LLM response', true);
+      const applyActions = async (
+        actions: TItem[],
+        llmStartedAt: number,
+      ) => {
+        if (actions.length === 0) {
           return;
         }
-
-        if (isIncomplete(formattedResponse)) {
-          showStatus('Waiting for a complete command', false);
-          return;
-        }
-
-        if (isUnknown(formattedResponse)) {
-          showStatus('Unknown command', true);
-          return;
-        }
-
-        const applied = await applyResponse(formattedResponse);
+        const applied = await applyResponse(actions);
         if (!applied) {
           showStatus('Could not apply command', true);
           return;
         }
-
+        appliedActionsRef.current = [
+          ...appliedActionsRef.current,
+          ...actions,
+        ];
+        const sample = buildCommandLatencySample({
+          utterance: utterance || queued.text,
+          appliedLabel: applied.label,
+          llmStartedAt,
+          appliedAt: Date.now(),
+        });
+        if (sample) {
+          console.log('[latency] llm to apply ms:', sample.llmToApplyMs);
+          recordCommandLatency(sample);
+        }
         if (applied.updateContext !== false) {
-          lastSuccessfulAgentResponseRef.current = formattedResponse;
+          lastSuccessfulAgentResponseRef.current = actions;
         }
         showStatus(`Applied: ${applied.label}`, false);
-      } catch {
-        showStatus('LLM inference failed', true);
+      };
+
+      const llmStartedAt = Date.now();
+      let incoming: TItem[] | null = null;
+
+      if (utterance) {
+        const alreadyGenerated = utterance === lastLlmUtteranceRef.current;
+        if (!alreadyGenerated) {
+          console.log('[LLM] utterance:', utterance);
+          try {
+            setCommandStatus({ message: 'Running on-device LLM…', isError: false });
+
+            const lastAgentResponse =
+              optionsRef.current.getAssistantContext?.() ??
+              lastSuccessfulAgentResponseRef.current;
+            const messages = [
+              { role: 'system' as const, content: getSystemPrompt() },
+              ...(lastAgentResponse
+                ? [
+                    {
+                      role: 'assistant' as const,
+                      content: JSON.stringify(lastAgentResponse),
+                    },
+                  ]
+                : []),
+              { role: 'user' as const, content: utterance },
+            ];
+            const reply = await currentLlm.generate(messages);
+            console.log('[LLM] response:', reply);
+            lastLlmUtteranceRef.current = utterance;
+
+            let parsed: unknown | undefined;
+            let parsedOk = false;
+            try {
+              parsed = fixAndValidateStructuredOutput(reply, z.unknown());
+              parsedOk = true;
+            } catch {
+              parsed = undefined;
+            }
+
+            const formattedResponse =
+              parsedOk && parsed !== undefined
+                ? parseValidActions(parsed, itemSchema)
+                : null;
+            if (!formattedResponse) {
+              showStatus('Could not parse LLM response', true);
+            } else if (isIncomplete(formattedResponse)) {
+              incoming = null;
+            } else if (isUnknown(formattedResponse)) {
+              showStatus('Unknown command', true);
+            } else {
+              incoming = formattedResponse;
+            }
+          } catch {
+            showStatus('LLM inference failed', true);
+          }
+        }
+      }
+
+      if (incoming && isActionList(incoming)) {
+        const pending = isActionItem(pendingActionRef.current)
+          ? pendingActionRef.current
+          : null;
+        const ingested = ingestPendingAction(
+          pending,
+          incoming,
+          appliedActionsRef.current,
+        );
+        pendingActionRef.current = ingested.pending as TItem | null;
+        await applyActions(ingested.toApply as TItem[], llmStartedAt);
+      } else if (incoming && queued.finalize) {
+        await applyActions(incoming, llmStartedAt);
+      }
+
+      if (queued.finalize) {
+        const remaining = flushPendingAction(
+          pendingActionRef.current,
+          appliedActionsRef.current,
+        );
+        pendingActionRef.current = null;
+        await applyActions(remaining, llmStartedAt);
+        appliedActionsRef.current = [];
+        lastLlmUtteranceRef.current = '';
       }
     },
     [showStatus],
@@ -196,16 +303,40 @@ export function useVoiceAgent<T>(options: UseVoiceAgentOptions<T>) {
   }, [processUtterance]);
 
   const enqueueUtterance = useCallback(
-    (committedSegment: string) => {
-      const input = committedSegment.trim();
-      if (!input) {
-        return;
-      }
+    (snapshot: string, finalize: boolean) => {
       if (!llmRef.current.isReady) {
         return;
       }
 
-      utteranceQueueRef.current.push(...splitSaveUtterance(input));
+      const input = snapshot.trim();
+      if (!input && !finalize) {
+        return;
+      }
+
+      if (!finalize) {
+        const last =
+          utteranceQueueRef.current[utteranceQueueRef.current.length - 1];
+        if (last && !last.finalize) {
+          last.text = input;
+        } else {
+          utteranceQueueRef.current.push({ text: input, finalize: false });
+        }
+      } else {
+        const last =
+          utteranceQueueRef.current[utteranceQueueRef.current.length - 1];
+        if (last && !last.finalize && last.text.trim() === input) {
+          last.finalize = true;
+        } else {
+          const segments = !input ? [''] : splitSaveUtterance(input);
+          const parts = segments.length > 0 ? segments : [''];
+          parts.forEach((text, index) => {
+            utteranceQueueRef.current.push({
+              text,
+              finalize: index === parts.length - 1,
+            });
+          });
+        }
+      }
 
       if (isProcessingQueueRef.current) {
         const pending = utteranceQueueRef.current.length;
@@ -225,15 +356,39 @@ export function useVoiceAgent<T>(options: UseVoiceAgentOptions<T>) {
     enqueueUtteranceRef.current = enqueueUtterance;
   }, [enqueueUtterance]);
 
+  const flushTranscriptDelta = useCallback(
+    (finalize = false, finalTranscript?: string) => {
+      const snapshot = (
+        finalize
+          ? (finalTranscript ?? currentUtterance())
+          : currentUtterance()
+      ).trim();
+      if (!snapshot && !finalize) {
+        return;
+      }
+      enqueueUtteranceRef.current(snapshot, finalize);
+    },
+    [currentUtterance],
+  );
+
+  const clearChunkTimer = useCallback(() => {
+    if (chunkTimerRef.current) {
+      clearInterval(chunkTimerRef.current);
+      chunkTimerRef.current = null;
+    }
+  }, []);
+
   const endSession = useCallback(() => {
     if (!sessionActiveRef.current) {
       return;
     }
     sessionActiveRef.current = false;
     setIsSessionActive(false);
+    clearChunkTimer();
+    flushTranscriptDelta(true);
     clearSafetyTimer();
     ExpoSpeechRecognitionModule.stop();
-  }, [clearSafetyTimer]);
+  }, [clearChunkTimer, clearSafetyTimer, flushTranscriptDelta]);
 
   const scheduleSafetyCap = useCallback(() => {
     clearSafetyTimer();
@@ -247,9 +402,11 @@ export function useVoiceAgent<T>(options: UseVoiceAgentOptions<T>) {
 
     if (event.isFinal) {
       committedTextRef.current += transcript + ' ';
+      interimTranscriptRef.current = '';
       setHeardText(committedTextRef.current.trim());
-      enqueueUtteranceRef.current(transcript);
+      flushTranscriptDelta(true, transcript);
     } else {
+      interimTranscriptRef.current = transcript;
       setHeardText((committedTextRef.current + transcript).trim());
     }
   });
@@ -270,6 +427,7 @@ export function useVoiceAgent<T>(options: UseVoiceAgentOptions<T>) {
   useEffect(() => {
     return () => {
       clearSafetyTimer();
+      clearChunkTimer();
       clearUtteranceQueue();
       if (commandStatusTimerRef.current) {
         clearTimeout(commandStatusTimerRef.current);
@@ -279,7 +437,7 @@ export function useVoiceAgent<T>(options: UseVoiceAgentOptions<T>) {
         ExpoSpeechRecognitionModule.stop();
       }
     };
-  }, [clearSafetyTimer, clearUtteranceQueue]);
+  }, [clearSafetyTimer, clearChunkTimer, clearUtteranceQueue]);
 
   const startSession = useCallback(async () => {
     if (!modelsReady) {
@@ -303,6 +461,11 @@ export function useVoiceAgent<T>(options: UseVoiceAgentOptions<T>) {
     sessionActiveRef.current = true;
     setIsSessionActive(true);
     scheduleSafetyCap();
+    clearChunkTimer();
+    chunkTimerRef.current = setInterval(
+      () => flushTranscriptDelta(false),
+      TRANSCRIPT_CHUNK_INTERVAL_MS,
+    );
 
     ExpoSpeechRecognitionModule.start({
       lang: 'en-IN',
@@ -317,6 +480,8 @@ export function useVoiceAgent<T>(options: UseVoiceAgentOptions<T>) {
     clearUtteranceQueue,
     clearAgentContext,
     scheduleSafetyCap,
+    clearChunkTimer,
+    flushTranscriptDelta,
   ]);
 
   const handleMicPress = useCallback(() => {
