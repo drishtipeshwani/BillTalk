@@ -1,7 +1,0 @@
-- +base.model_class=lfm2_5_350m
-- +base.params=/Users/drishtipeshwani/et-export/lib/python3.13/site-packages/executorch/examples/models/lfm2/config/lfm2_5_350m_config.json
-- +base.checkpoint=/Users/drishtipeshwani/Documents/projects/voicebillingapp/finetune/output/invoice_lfm2_5_350m.pth
-- model.dtype_override=fp16
-- +export.max_seq_length=2048
-- +export.max_context_length=2048
-- +export.output_name=invoice_lfm2_5_350m_fp16.pte
