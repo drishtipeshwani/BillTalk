@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Text, View } from 'react-native';
+import { Alert, Text, View } from 'react-native';
 import { useSQLiteContext } from 'expo-sqlite';
 import VoiceComposer from './VoiceComposer';
 import { STOCK_SYSTEM_PROMPT_SHORT } from '../utils/stockSystemPrompt';
 import {
+  DeleteBlockedError,
   DuplicateNameError,
   SaveRecordError,
+  deleteStockItem,
   insertStockItem,
   updateStockItem,
 } from '../db/queries';
@@ -92,6 +94,7 @@ export default function AddStockComposer({
     };
   });
   const [isSaving, setIsSaving] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
   const draftRef = useRef(draft);
   const persistStockRef = useRef<() => Promise<boolean>>(async () => false);
 
@@ -208,12 +211,66 @@ export default function AddStockComposer({
     void persistStock();
   };
 
+  const performDelete = useCallback(async () => {
+    if (!user || !existingItem || isDeleting) {
+      return;
+    }
+    setIsDeleting(true);
+    try {
+      await deleteStockItem(db, user.id, existingItem.id);
+      bumpData();
+      endSession();
+      onSaved?.();
+      onClose();
+    } catch (error) {
+      const message =
+        error instanceof DeleteBlockedError || error instanceof SaveRecordError
+          ? error.message
+          : 'Could not delete the stock item. Please try again.';
+      showStatus(message, true);
+    } finally {
+      setIsDeleting(false);
+    }
+  }, [
+    bumpData,
+    db,
+    endSession,
+    existingItem,
+    isDeleting,
+    onClose,
+    onSaved,
+    showStatus,
+    user,
+  ]);
+
+  const handleDelete = () => {
+    if (!existingItem) {
+      return;
+    }
+    Alert.alert(
+      'Delete stock item',
+      `Delete "${existingItem.name}"? This cannot be undone.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: () => {
+            void performDelete();
+          },
+        },
+      ],
+    );
+  };
+
   return (
     <VoiceComposer
       title={existingItem ? 'Edit stock item' : 'New stock item'}
       subtitle="Speak a command — name, quantity, cost, selling price"
       onCancel={handleCancel}
       onSave={handleSave}
+      onDelete={existingItem ? handleDelete : undefined}
+      isDeleting={isDeleting}
       isSaving={isSaving}
       heardText={heardText}
       commandStatus={commandStatus}

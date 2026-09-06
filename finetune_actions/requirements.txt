@@ -1,5 +1,10 @@
-# LoRA SFT training stack for finetune_actions/. Reuse finetune/.venv if it
-# already has these pins; otherwise:
+# LoRA SFT training stack for finetune_actions/. Deliberately excludes
+# bitsandbytes: the target models (LFM 350M / Hammer 1.5B) are small enough
+# to LoRA-tune in fp32/bf16 without 4-bit quantization, and bitsandbytes'
+# Metal/MPS kernels are still an unaccelerated fallback (see README.md).
+# Revisit if a larger base model is ever considered.
+#
+# Installed into finetune_actions/.venv with:
 #   python3 -m venv finetune_actions/.venv
 #   finetune_actions/.venv/bin/pip install -r finetune_actions/requirements.txt
 

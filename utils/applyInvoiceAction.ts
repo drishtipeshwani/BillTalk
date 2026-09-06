@@ -12,6 +12,17 @@ function findItemIndex(invoice: Invoice, name: string): number {
   return invoice.items.findIndex((item) => entityNamesMatch(item.name, name));
 }
 
+/** Last named line item — used as assistant-context fallback when no prior LLM reply exists. */
+export function currentInvoiceItemName(invoice: Invoice): string | null {
+  for (let index = invoice.items.length - 1; index >= 0; index -= 1) {
+    const name = invoice.items[index]?.name.trim();
+    if (name) {
+      return name;
+    }
+  }
+  return null;
+}
+
 function blankItem(name: string): InvoiceItem {
   return {
     name,
@@ -101,7 +112,11 @@ function applyOneAction(invoice: Invoice, action: Action): Invoice | null {
     }
 
     case ActionName.DELETE_ITEM: {
-      const index = findItemIndex(invoice, action.name);
+      const targetName = action.name?.trim() || currentInvoiceItemName(invoice);
+      if (!targetName) {
+        return null;
+      }
+      const index = findItemIndex(invoice, targetName);
       if (index === -1) {
         return null;
       }
@@ -193,6 +208,7 @@ function applyOneAction(invoice: Invoice, action: Action): Invoice | null {
       return { ...emptyInvoice, companyName: invoice.companyName };
 
     case ActionName.SAVE_INVOICE:
+    case ActionName.DELETE_INVOICE:
     case ActionName.UNKNOWN:
     case ActionName.INCOMPLETE:
       return null;
@@ -207,7 +223,10 @@ export function applySingleInvoiceAction(
   invoice: Invoice,
   action: Action,
 ): Invoice | null {
-  if (action.action === ActionName.SAVE_INVOICE) {
+  if (
+    action.action === ActionName.SAVE_INVOICE ||
+    action.action === ActionName.DELETE_INVOICE
+  ) {
     return null;
   }
   const next = applyOneAction(invoice, action);
@@ -224,6 +243,10 @@ export function isUnknownInvoiceAction(response: AgentActionResponse): boolean {
 
 export function isSaveInvoiceAction(response: AgentActionResponse): boolean {
   return response.length === 1 && response[0].action === ActionName.SAVE_INVOICE;
+}
+
+export function isDeleteInvoiceAction(response: AgentActionResponse): boolean {
+  return response.length === 1 && response[0].action === ActionName.DELETE_INVOICE;
 }
 
 export function describeInvoiceAction(response: AgentActionResponse): string {

@@ -6,8 +6,8 @@ import {
 import { fixAndValidateStructuredOutput } from 'react-native-executorch';
 import { z } from 'zod';
 import {
-  buildCommandLatencySample,
-  recordCommandLatency,
+  buildLlmInferenceSample,
+  recordLlmInferenceLatency,
 } from './commandLatency';
 import { useOnDeviceAI } from './OnDeviceAIProvider';
 import { parseValidActions } from './parseAgentActions';
@@ -16,8 +16,6 @@ import { TRANSCRIPT_CHUNK_INTERVAL_MS } from './transcriptDelta';
 import {
   flushPendingAction,
   ingestPendingAction,
-  isActionItem,
-  isActionList,
 } from './actionHypothesis';
 
 interface QueuedUtterance {
@@ -25,8 +23,32 @@ interface QueuedUtterance {
   finalize: boolean;
 }
 
-const MAX_SESSION_DURATION_MS = 60000;
+const SILENCE_TIMEOUT_MS = 60_000;
 const COMMAND_STATUS_DISPLAY_MS = 2500;
+
+const SPEECH_RECOGNITION_OPTIONS = {
+  lang: 'en-IN',
+  interimResults: true,
+  continuous: true,
+  requiresOnDeviceRecognition: true,
+  addsPunctuation: false,
+  androidIntentOptions: {
+    EXTRA_SPEECH_INPUT_COMPLETE_SILENCE_LENGTH_MILLIS: SILENCE_TIMEOUT_MS,
+    EXTRA_SPEECH_INPUT_POSSIBLY_COMPLETE_SILENCE_LENGTH_MILLIS:
+      SILENCE_TIMEOUT_MS,
+  },
+} as const;
+
+const RECOVERABLE_SPEECH_ERRORS = new Set([
+  'aborted',
+  'busy',
+  'client',
+  'interrupted',
+  'network',
+  'no-speech',
+  'speech-timeout',
+  'unknown',
+]);
 
 export interface CommandStatus {
   message: string;
@@ -39,7 +61,7 @@ export interface VoiceAgentApplyResult {
   updateContext?: boolean;
 }
 
-interface UseVoiceAgentOptions<TItem> {
+interface UseVoiceAgentOptions<TItem extends { action: string }> {
   itemSchema: z.ZodType<TItem>;
   getSystemPrompt: () => string;
   applyResponse: (
@@ -47,11 +69,13 @@ interface UseVoiceAgentOptions<TItem> {
   ) => VoiceAgentApplyResult | null | Promise<VoiceAgentApplyResult | null>;
   isIncomplete: (response: TItem[]) => boolean;
   isUnknown: (response: TItem[]) => boolean;
-  /** Current draft/item identity to send as previous-assistant JSON. */
+  /** Fallback draft/item identity when there is no prior LLM response yet. */
   getAssistantContext?: () => TItem[] | null;
 }
 
-export function useVoiceAgent<TItem>(options: UseVoiceAgentOptions<TItem>) {
+export function useVoiceAgent<TItem extends { action: string }>(
+  options: UseVoiceAgentOptions<TItem>,
+) {
   const { llm } = useOnDeviceAI();
 
   const [isSessionActive, setIsSessionActive] = useState(false);
@@ -63,8 +87,10 @@ export function useVoiceAgent<TItem>(options: UseVoiceAgentOptions<TItem>) {
   const committedTextRef = useRef('');
   const interimTranscriptRef = useRef('');
   const chunkTimerRef = useRef<ReturnType<typeof setInterval> | null>(null);
-  const safetyTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const silenceTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const commandStatusTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const stopRequestedRef = useRef(false);
+  const startAfterEndRef = useRef(false);
   const llmRef = useRef(llm);
   const utteranceQueueRef = useRef<QueuedUtterance[]>([]);
   const isProcessingQueueRef = useRef(false);
@@ -89,6 +115,9 @@ export function useVoiceAgent<TItem>(options: UseVoiceAgentOptions<TItem>) {
     llm.configure({
       generationConfig: {
         temperature: 0,
+        // Emit each token so TTFT measures the first visible model token,
+        // rather than the first larger token batch.
+        outputTokenBatchSize: 1,
       },
     });
   }, [llm.isReady, llm.configure]);
@@ -97,10 +126,10 @@ export function useVoiceAgent<TItem>(options: UseVoiceAgentOptions<TItem>) {
   const downloadProgress = llm.downloadProgress;
   const modelError = llm.error?.message ?? null;
 
-  const clearSafetyTimer = useCallback(() => {
-    if (safetyTimerRef.current) {
-      clearTimeout(safetyTimerRef.current);
-      safetyTimerRef.current = null;
+  const clearSilenceTimer = useCallback(() => {
+    if (silenceTimerRef.current) {
+      clearTimeout(silenceTimerRef.current);
+      silenceTimerRef.current = null;
     }
   }, []);
 
@@ -162,10 +191,7 @@ export function useVoiceAgent<TItem>(options: UseVoiceAgentOptions<TItem>) {
         isUnknown,
       } = optionsRef.current;
 
-      const applyActions = async (
-        actions: TItem[],
-        llmStartedAt: number,
-      ) => {
+      const applyActions = async (actions: TItem[]) => {
         if (actions.length === 0) {
           return;
         }
@@ -178,23 +204,12 @@ export function useVoiceAgent<TItem>(options: UseVoiceAgentOptions<TItem>) {
           ...appliedActionsRef.current,
           ...actions,
         ];
-        const sample = buildCommandLatencySample({
-          utterance: utterance || queued.text,
-          appliedLabel: applied.label,
-          llmStartedAt,
-          appliedAt: Date.now(),
-        });
-        if (sample) {
-          console.log('[latency] llm to apply ms:', sample.llmToApplyMs);
-          recordCommandLatency(sample);
-        }
         if (applied.updateContext !== false) {
           lastSuccessfulAgentResponseRef.current = actions;
         }
         showStatus(`Applied: ${applied.label}`, false);
       };
 
-      const llmStartedAt = Date.now();
       let incoming: TItem[] | null = null;
 
       if (utterance) {
@@ -205,8 +220,16 @@ export function useVoiceAgent<TItem>(options: UseVoiceAgentOptions<TItem>) {
             setCommandStatus({ message: 'Running on-device LLM…', isError: false });
 
             const lastAgentResponse =
-              optionsRef.current.getAssistantContext?.() ??
-              lastSuccessfulAgentResponseRef.current;
+              lastSuccessfulAgentResponseRef.current ??
+              optionsRef.current.getAssistantContext?.();
+            if (lastAgentResponse) {
+              console.log(
+                '[LLM] assistant context sent:',
+                JSON.stringify(lastAgentResponse),
+              );
+            } else {
+              console.log('[LLM] assistant context sent: none');
+            }
             const messages = [
               { role: 'system' as const, content: getSystemPrompt() },
               ...(lastAgentResponse
@@ -219,7 +242,43 @@ export function useVoiceAgent<TItem>(options: UseVoiceAgentOptions<TItem>) {
                 : []),
               { role: 'user' as const, content: utterance },
             ];
-            const reply = await currentLlm.generate(messages);
+            const startedAt = Date.now();
+            let firstTokenAt: number | null = null;
+            const reply = await currentLlm.generate(messages, () => {
+              firstTokenAt ??= Date.now();
+            });
+            const finishedAt = Date.now();
+
+            let promptTokenCount: number | null = null;
+            let generatedTokenCount: number | null = null;
+            let totalTokenCount: number | null = null;
+            try {
+              promptTokenCount = currentLlm.getPromptTokenCount();
+              generatedTokenCount = currentLlm.getGeneratedTokenCount();
+              totalTokenCount = currentLlm.getTotalTokenCount();
+            } catch (tokenCountError) {
+              console.warn('[latency] failed to read token counts', tokenCountError);
+            }
+
+            const sample = buildLlmInferenceSample({
+              utterance,
+              startedAt,
+              finishedAt,
+              firstTokenAt,
+              promptTokenCount,
+              generatedTokenCount,
+              totalTokenCount,
+            });
+            if (sample) {
+              console.log('[latency] inference metrics:', {
+                inferenceMs: sample.inferenceMs,
+                ttftMs: sample.ttftMs,
+                promptTokenCount: sample.promptTokenCount,
+                generatedTokenCount: sample.generatedTokenCount,
+                totalTokenCount: sample.totalTokenCount,
+              });
+              recordLlmInferenceLatency(sample);
+            }
             console.log('[LLM] response:', reply);
             lastLlmUtteranceRef.current = utterance;
 
@@ -251,19 +310,14 @@ export function useVoiceAgent<TItem>(options: UseVoiceAgentOptions<TItem>) {
         }
       }
 
-      if (incoming && isActionList(incoming)) {
-        const pending = isActionItem(pendingActionRef.current)
-          ? pendingActionRef.current
-          : null;
-        const ingested = ingestPendingAction(
-          pending,
+      if (incoming) {
+        const ingested = ingestPendingAction<TItem>(
+          pendingActionRef.current,
           incoming,
           appliedActionsRef.current,
         );
-        pendingActionRef.current = ingested.pending as TItem | null;
-        await applyActions(ingested.toApply as TItem[], llmStartedAt);
-      } else if (incoming && queued.finalize) {
-        await applyActions(incoming, llmStartedAt);
+        pendingActionRef.current = ingested.pending;
+        await applyActions(ingested.toApply);
       }
 
       if (queued.finalize) {
@@ -272,7 +326,7 @@ export function useVoiceAgent<TItem>(options: UseVoiceAgentOptions<TItem>) {
           appliedActionsRef.current,
         );
         pendingActionRef.current = null;
-        await applyActions(remaining, llmStartedAt);
+        await applyActions(remaining);
         appliedActionsRef.current = [];
         lastLlmUtteranceRef.current = '';
       }
@@ -378,27 +432,36 @@ export function useVoiceAgent<TItem>(options: UseVoiceAgentOptions<TItem>) {
     }
   }, []);
 
+  const startSpeechRecognition = useCallback(() => {
+    ExpoSpeechRecognitionModule.start(SPEECH_RECOGNITION_OPTIONS);
+  }, []);
+
   const endSession = useCallback(() => {
     if (!sessionActiveRef.current) {
       return;
     }
+    stopRequestedRef.current = true;
+    startAfterEndRef.current = false;
     sessionActiveRef.current = false;
     setIsSessionActive(false);
     clearChunkTimer();
     flushTranscriptDelta(true);
-    clearSafetyTimer();
+    clearSilenceTimer();
     ExpoSpeechRecognitionModule.stop();
-  }, [clearChunkTimer, clearSafetyTimer, flushTranscriptDelta]);
+  }, [clearChunkTimer, clearSilenceTimer, flushTranscriptDelta]);
 
-  const scheduleSafetyCap = useCallback(() => {
-    clearSafetyTimer();
-    safetyTimerRef.current = setTimeout(endSession, MAX_SESSION_DURATION_MS);
-  }, [clearSafetyTimer, endSession]);
+  const scheduleSilenceTimeout = useCallback(() => {
+    clearSilenceTimer();
+    silenceTimerRef.current = setTimeout(endSession, SILENCE_TIMEOUT_MS);
+  }, [clearSilenceTimer, endSession]);
 
   useSpeechRecognitionEvent('result', (event) => {
     if (!sessionActiveRef.current) return;
 
     const transcript = event.results[0]?.transcript ?? '';
+    if (transcript.trim()) {
+      scheduleSilenceTimeout();
+    }
 
     if (event.isFinal) {
       committedTextRef.current += transcript + ' ';
@@ -411,33 +474,56 @@ export function useVoiceAgent<TItem>(options: UseVoiceAgentOptions<TItem>) {
     }
   });
 
-  useSpeechRecognitionEvent('error', (event) => {
+  useSpeechRecognitionEvent('speechstart', () => {
     if (sessionActiveRef.current) {
-      endSession();
-      setErrorMessage(`Speech recognition failed: ${event.message}`);
+      scheduleSilenceTimeout();
     }
   });
 
-  useSpeechRecognitionEvent('end', () => {
-    if (sessionActiveRef.current) {
-      endSession();
+  useSpeechRecognitionEvent('error', (event) => {
+    if (!sessionActiveRef.current) {
+      return;
     }
+    if (RECOVERABLE_SPEECH_ERRORS.has(event.error)) {
+      return;
+    }
+    endSession();
+    setErrorMessage(`Speech recognition failed: ${event.message}`);
+  });
+
+  useSpeechRecognitionEvent('end', () => {
+    if (stopRequestedRef.current) {
+      stopRequestedRef.current = false;
+      if (startAfterEndRef.current && sessionActiveRef.current) {
+        startAfterEndRef.current = false;
+        startSpeechRecognition();
+      }
+      return;
+    }
+    if (!sessionActiveRef.current) {
+      return;
+    }
+    if (interimTranscriptRef.current.trim()) {
+      flushTranscriptDelta(true);
+    }
+    startSpeechRecognition();
   });
 
   useEffect(() => {
     return () => {
-      clearSafetyTimer();
+      clearSilenceTimer();
       clearChunkTimer();
       clearUtteranceQueue();
       if (commandStatusTimerRef.current) {
         clearTimeout(commandStatusTimerRef.current);
       }
       if (sessionActiveRef.current) {
+        stopRequestedRef.current = true;
         sessionActiveRef.current = false;
         ExpoSpeechRecognitionModule.stop();
       }
     };
-  }, [clearSafetyTimer, clearChunkTimer, clearUtteranceQueue]);
+  }, [clearSilenceTimer, clearChunkTimer, clearUtteranceQueue]);
 
   const startSession = useCallback(async () => {
     if (!modelsReady) {
@@ -460,28 +546,27 @@ export function useVoiceAgent<TItem>(options: UseVoiceAgentOptions<TItem>) {
 
     sessionActiveRef.current = true;
     setIsSessionActive(true);
-    scheduleSafetyCap();
+    scheduleSilenceTimeout();
     clearChunkTimer();
     chunkTimerRef.current = setInterval(
       () => flushTranscriptDelta(false),
       TRANSCRIPT_CHUNK_INTERVAL_MS,
     );
 
-    ExpoSpeechRecognitionModule.start({
-      lang: 'en-IN',
-      interimResults: true,
-      continuous: true,
-      requiresOnDeviceRecognition: true,
-      addsPunctuation: false,
-    });
+    if (stopRequestedRef.current) {
+      startAfterEndRef.current = true;
+    } else {
+      startSpeechRecognition();
+    }
   }, [
     modelsReady,
     clearTranscript,
     clearUtteranceQueue,
     clearAgentContext,
-    scheduleSafetyCap,
+    scheduleSilenceTimeout,
     clearChunkTimer,
     flushTranscriptDelta,
+    startSpeechRecognition,
   ]);
 
   const handleMicPress = useCallback(() => {

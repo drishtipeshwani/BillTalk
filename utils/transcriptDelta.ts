@@ -1,4 +1,4 @@
-export const TRANSCRIPT_CHUNK_INTERVAL_MS = 300;
+export const TRANSCRIPT_CHUNK_INTERVAL_MS = 500;
 
 /**
  * Take the unsent suffix of the live STT transcript. `sentLength` is how

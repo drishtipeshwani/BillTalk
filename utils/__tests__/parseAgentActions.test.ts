@@ -59,4 +59,13 @@ describe('parseValidActions', () => {
   it('returns null for an empty array', () => {
     expect(parseValidActions([], ActionSchema)).toBeNull();
   });
+
+  it('accepts DELETE_ITEM without a name and DELETE_INVOICE', () => {
+    expect(
+      parseValidActions([{ action: 'DELETE_ITEM' }], ActionSchema),
+    ).toEqual([{ action: 'DELETE_ITEM' }]);
+    expect(
+      parseValidActions([{ action: 'DELETE_INVOICE' }], ActionSchema),
+    ).toEqual([{ action: 'DELETE_INVOICE' }]);
+  });
 });

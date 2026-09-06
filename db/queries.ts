@@ -297,6 +297,13 @@ export class DuplicateNameError extends Error {
   }
 }
 
+export class DeleteBlockedError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = 'DeleteBlockedError';
+  }
+}
+
 function isUniqueConstraintError(error: unknown): boolean {
   const message = error instanceof Error ? error.message : String(error);
   return /UNIQUE/i.test(message);
@@ -378,21 +385,8 @@ export async function insertStockItem(
     throw new SaveRecordError('Add an item name before saving.');
   }
 
-  const existing = await findStockByName(db, userId, name);
-  if (existing) {
-    const quantity = existing.quantity + input.quantity;
-    await db.runAsync(
-      'UPDATE stock SET quantity = ? WHERE id = ?',
-      quantity,
-      existing.id,
-    );
-    return {
-      id: existing.id,
-      name,
-      quantity,
-      costPrice: existing.cost_price,
-      sellingPrice: existing.selling_price,
-    };
+  if (await findStockByName(db, userId, name)) {
+    throw new DuplicateNameError(`A stock item named "${name}" already exists.`);
   }
 
   const id = newId();
@@ -479,6 +473,40 @@ export async function updateStockItem(
     costPrice: input.costPrice,
     sellingPrice: input.sellingPrice,
   };
+}
+
+export async function deleteStockItem(
+  db: SQLiteDatabase,
+  userId: string,
+  id: string,
+): Promise<void> {
+  const stock = await db.getFirstAsync<{ name: string }>(
+    'SELECT name FROM stock WHERE id = ? AND user_id = ?',
+    id,
+    userId,
+  );
+  if (!stock) {
+    throw new SaveRecordError('Could not delete this stock item.');
+  }
+
+  const referencing = await db.getFirstAsync<{ count: number }>(
+    `SELECT COUNT(*) AS count FROM invoice_items
+     INNER JOIN invoices ON invoices.id = invoice_items.invoice_id
+     WHERE invoices.user_id = ? AND invoice_items.name = ? COLLATE NOCASE`,
+    userId,
+    stock.name,
+  );
+  if ((referencing?.count ?? 0) > 0) {
+    throw new DeleteBlockedError(
+      'This item appears on saved invoices. Delete those invoices first.',
+    );
+  }
+
+  await db.runAsync(
+    'DELETE FROM stock WHERE id = ? AND user_id = ?',
+    id,
+    userId,
+  );
 }
 
 export async function insertCustomer(
@@ -570,6 +598,33 @@ export async function updateCustomer(
     name,
     balanceAmount: input.balanceAmount,
   };
+}
+
+export async function deleteCustomer(
+  db: SQLiteDatabase,
+  userId: string,
+  id: string,
+): Promise<void> {
+  const referencing = await db.getFirstAsync<{ count: number }>(
+    `SELECT COUNT(*) AS count FROM invoices
+     WHERE user_id = ? AND customer_id = ?`,
+    userId,
+    id,
+  );
+  if ((referencing?.count ?? 0) > 0) {
+    throw new DeleteBlockedError(
+      'This customer has saved invoices. Delete those invoices first.',
+    );
+  }
+
+  const result = await db.runAsync(
+    'DELETE FROM customers WHERE id = ? AND user_id = ?',
+    id,
+    userId,
+  );
+  if (result.changes === 0) {
+    throw new SaveRecordError('Could not delete this customer.');
+  }
 }
 
 async function applyStockSale(
@@ -815,6 +870,52 @@ export async function updateInvoice(
 
     await db.runAsync('DELETE FROM invoice_items WHERE invoice_id = ?', invoiceId);
     await insertInvoiceItems(db, userId, invoiceId, items);
+  });
+}
+
+export async function deleteInvoice(
+  db: SQLiteDatabase,
+  userId: string,
+  invoiceId: string,
+): Promise<void> {
+  await db.withTransactionAsync(async () => {
+    const existing = await db.getFirstAsync<{
+      customer_id: string;
+      total_amount: number;
+    }>(
+      `SELECT customer_id, total_amount
+       FROM invoices
+       WHERE id = ? AND user_id = ?`,
+      invoiceId,
+      userId,
+    );
+    if (!existing) {
+      throw new SaveInvoiceError('Could not delete this invoice.');
+    }
+
+    const oldItems = await db.getAllAsync<{
+      name: string;
+      quantity: number | null;
+    }>(
+      `SELECT name, quantity FROM invoice_items WHERE invoice_id = ?`,
+      invoiceId,
+    );
+    for (const item of oldItems) {
+      await restoreStockSale(db, userId, item.name, item.quantity ?? 0);
+    }
+
+    await db.runAsync(
+      'UPDATE customers SET balance_amount = balance_amount - ? WHERE id = ?',
+      existing.total_amount,
+      existing.customer_id,
+    );
+
+    await db.runAsync('DELETE FROM invoice_items WHERE invoice_id = ?', invoiceId);
+    await db.runAsync(
+      'DELETE FROM invoices WHERE id = ? AND user_id = ?',
+      invoiceId,
+      userId,
+    );
   });
 }
 

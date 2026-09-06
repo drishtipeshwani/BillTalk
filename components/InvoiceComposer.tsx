@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState, type ReactNode } from 'react';
 import {
   ActivityIndicator,
+  Alert,
   Pressable,
   ScrollView,
   Text,
@@ -25,6 +26,7 @@ import {
 import {
   SaveInvoiceError,
   customerExists,
+  deleteInvoice,
   getInvoiceById,
   listCustomers,
   listStockItems,
@@ -37,6 +39,7 @@ import { useAuth } from '../utils/authContext';
 import { useShopData } from '../utils/shopDataContext';
 import {
   describeInvoiceAction,
+  isDeleteInvoiceAction,
   isIncompleteInvoiceAction,
   isSaveInvoiceAction,
   isUnknownInvoiceAction,
@@ -78,6 +81,7 @@ export default function InvoiceComposer({
   const [isGeneratingPdf, setIsGeneratingPdf] = useState(false);
   const [pdfError, setPdfError] = useState<string | null>(null);
   const [isSaving, setIsSaving] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
   const [activePrompt, setActivePrompt] = useState<EntityPrompt | null>(null);
   const [composerKind, setComposerKind] = useState<EntityPrompt['kind'] | null>(null);
 
@@ -86,6 +90,7 @@ export default function InvoiceComposer({
   const promptQueueRef = useRef<EntityPrompt[]>([]);
   const composerSavedRef = useRef(false);
   const persistInvoiceRef = useRef<() => Promise<boolean>>(async () => false);
+  const deleteInvoiceRef = useRef<() => Promise<void>>(async () => undefined);
   const resumeFromPromptRef = useRef<(applyPending: boolean) => void>(() => undefined);
 
   useEffect(() => {
@@ -223,6 +228,14 @@ export default function InvoiceComposer({
         return { label: 'SAVE_INVOICE', updateContext: false };
       }
 
+      if (isDeleteInvoiceAction(formattedResponse)) {
+        if (!existingInvoiceId) {
+          return null;
+        }
+        void deleteInvoiceRef.current();
+        return { label: 'DELETE_INVOICE', updateContext: false };
+      }
+
       const outcome = await processGatedInvoiceActions(
         invoiceRef.current,
         formattedResponse,
@@ -247,7 +260,7 @@ export default function InvoiceComposer({
         updateContext: !outcome.prompt,
       };
     },
-    [commitInvoice, enqueuePrompt, lookup],
+    [commitInvoice, enqueuePrompt, existingInvoiceId, lookup],
   );
 
   const {
@@ -358,6 +371,65 @@ export default function InvoiceComposer({
   const handleCancel = () => {
     endSession();
     onClose?.();
+  };
+
+  const performDelete = useCallback(async () => {
+    if (!user || !existingInvoiceId || isDeleting || isSaving) {
+      return;
+    }
+    setIsDeleting(true);
+    try {
+      await deleteInvoice(db, user.id, existingInvoiceId);
+      bumpData();
+      endSession();
+      onSaved?.();
+      onClose?.();
+    } catch (error) {
+      const message =
+        error instanceof SaveInvoiceError
+          ? error.message
+          : 'Could not delete the invoice. Please try again.';
+      showStatus(message, true);
+    } finally {
+      setIsDeleting(false);
+    }
+  }, [
+    bumpData,
+    db,
+    endSession,
+    existingInvoiceId,
+    isDeleting,
+    isSaving,
+    onClose,
+    onSaved,
+    showStatus,
+    user,
+  ]);
+
+  useEffect(() => {
+    deleteInvoiceRef.current = performDelete;
+  }, [performDelete]);
+
+  const handleDelete = () => {
+    if (!existingInvoiceId) {
+      return;
+    }
+    Alert.alert(
+      'Delete invoice',
+      invoiceNumber
+        ? `Delete invoice #${invoiceNumber}? Stock and the customer's balance will be restored. This cannot be undone.`
+        : `Delete this invoice? Stock and the customer's balance will be restored. This cannot be undone.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: () => {
+            void performDelete();
+          },
+        },
+      ],
+    );
   };
 
   const handlePromptNo = () => {
@@ -481,6 +553,26 @@ export default function InvoiceComposer({
                 <Text style={styles.downloadButtonText}>PDF ⬇</Text>
               )}
             </Pressable>
+            {isEditing ? (
+              <Pressable
+                onPress={handleDelete}
+                disabled={isDeleting || isSaving || isLoading || loadError}
+                accessibilityRole="button"
+                accessibilityLabel="Delete invoice"
+                style={({ pressed }) => [
+                  styles.deleteButton,
+                  pressed && styles.deleteButtonPressed,
+                  (isDeleting || isSaving || isLoading || loadError) &&
+                    styles.deleteButtonPressed,
+                ]}
+              >
+                {isDeleting ? (
+                  <ActivityIndicator size="small" color="#D64545" />
+                ) : (
+                  <Text style={styles.deleteButtonText}>Delete</Text>
+                )}
+              </Pressable>
+            ) : null}
           </View>
         </View>
       </View>

@@ -98,4 +98,51 @@ describe('applySingleInvoiceAction unique item names', () => {
       pricePerItem: 450,
     });
   });
+
+  it('deletes a named line item', () => {
+    const withItem = applySingleInvoiceAction(invoice, {
+      action: ActionName.ADD_ITEM,
+      name: 'cheese',
+      quantity: 1,
+    });
+    const next = applySingleInvoiceAction(withItem!, {
+      action: ActionName.DELETE_ITEM,
+      name: 'cheese',
+    });
+    expect(next?.items).toHaveLength(0);
+  });
+
+  it('deletes the current (last named) item when DELETE_ITEM omits name', () => {
+    const withItems = {
+      ...invoice,
+      items: [
+        {
+          name: 'milk',
+          quantity: 1,
+          pricePerItem: 40,
+          discountPercent: null,
+          discountAmount: null,
+        },
+        {
+          name: 'cheese',
+          quantity: 2,
+          pricePerItem: 80,
+          discountPercent: null,
+          discountAmount: null,
+        },
+      ],
+    };
+    const next = applySingleInvoiceAction(withItems, {
+      action: ActionName.DELETE_ITEM,
+    });
+    expect(next?.items).toEqual([
+      {
+        name: 'milk',
+        quantity: 1,
+        pricePerItem: 40,
+        discountPercent: null,
+        discountAmount: null,
+      },
+    ]);
+  });
 });

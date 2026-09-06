@@ -5,8 +5,8 @@ The React Native ExecuTorch runtime cannot load a PEFT adapter. Export to
 .pte needs a single merged checkpoint.
 
 Usage:
-    finetune/.venv/bin/python finetune_actions/merge_lora.py
-    finetune/.venv/bin/python finetune_actions/merge_lora.py --adapter finetune_actions/output/final
+    finetune_actions/.venv/bin/python finetune_actions/merge_lora.py
+    finetune_actions/.venv/bin/python finetune_actions/merge_lora.py --adapter finetune_actions/output/final
 """
 
 from __future__ import annotations

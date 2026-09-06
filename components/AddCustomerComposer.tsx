@@ -1,11 +1,13 @@
 import { useCallback, useEffect, useRef, useState } from 'react';
-import { Text, View } from 'react-native';
+import { Alert, Text, View } from 'react-native';
 import { useSQLiteContext } from 'expo-sqlite';
 import VoiceComposer from './VoiceComposer';
 import { CUSTOMER_SYSTEM_PROMPT_SHORT } from '../utils/customerSystemPrompt';
 import {
+  DeleteBlockedError,
   DuplicateNameError,
   SaveRecordError,
+  deleteCustomer,
   insertCustomer,
   updateCustomer,
 } from '../db/queries';
@@ -20,6 +22,7 @@ import { useAuth } from '../utils/authContext';
 import {
   applyCustomerAction,
   describeCustomerAction,
+  isDeleteCustomerAction,
   isIncompleteCustomerAction,
   isSaveCustomerAction,
   isUnknownCustomerAction,
@@ -84,8 +87,10 @@ export default function AddCustomerComposer({
     };
   });
   const [isSaving, setIsSaving] = useState(false);
+  const [isDeleting, setIsDeleting] = useState(false);
   const draftRef = useRef(draft);
   const persistCustomerRef = useRef<() => Promise<boolean>>(async () => false);
+  const deleteCustomerRef = useRef<() => Promise<void>>(async () => undefined);
 
   useEffect(() => {
     draftRef.current = draft;
@@ -97,6 +102,14 @@ export default function AddCustomerComposer({
       return { label: 'SAVE', updateContext: false };
     }
 
+    if (isDeleteCustomerAction(response)) {
+      if (!existingCustomer) {
+        return null;
+      }
+      void deleteCustomerRef.current();
+      return { label: 'DELETE_CUSTOMER', updateContext: false };
+    }
+
     const label = describeCustomerAction(response);
     const next = applyCustomerAction(draftRef.current, response);
     if (!next) {
@@ -105,7 +118,7 @@ export default function AddCustomerComposer({
     draftRef.current = next;
     setDraft(next);
     return { label };
-  }, []);
+  }, [existingCustomer]);
 
   const {
     isSessionActive,
@@ -198,6 +211,62 @@ export default function AddCustomerComposer({
     void persistCustomer();
   };
 
+  const performDelete = useCallback(async () => {
+    if (!user || !existingCustomer || isDeleting) {
+      return;
+    }
+    setIsDeleting(true);
+    try {
+      await deleteCustomer(db, user.id, existingCustomer.id);
+      bumpData();
+      endSession();
+      onSaved?.();
+      onClose();
+    } catch (error) {
+      const message =
+        error instanceof DeleteBlockedError || error instanceof SaveRecordError
+          ? error.message
+          : 'Could not delete the customer. Please try again.';
+      showStatus(message, true);
+    } finally {
+      setIsDeleting(false);
+    }
+  }, [
+    bumpData,
+    db,
+    endSession,
+    existingCustomer,
+    isDeleting,
+    onClose,
+    onSaved,
+    showStatus,
+    user,
+  ]);
+
+  useEffect(() => {
+    deleteCustomerRef.current = performDelete;
+  }, [performDelete]);
+
+  const handleDelete = () => {
+    if (!existingCustomer) {
+      return;
+    }
+    Alert.alert(
+      'Delete customer',
+      `Delete "${existingCustomer.name}"? This cannot be undone.`,
+      [
+        { text: 'Cancel', style: 'cancel' },
+        {
+          text: 'Delete',
+          style: 'destructive',
+          onPress: () => {
+            void performDelete();
+          },
+        },
+      ],
+    );
+  };
+
   return (
     <VoiceComposer
       title={existingCustomer ? 'Edit customer' : 'New customer'}
@@ -208,6 +277,8 @@ export default function AddCustomerComposer({
       }
       onCancel={handleCancel}
       onSave={handleSave}
+      onDelete={existingCustomer ? handleDelete : undefined}
+      isDeleting={isDeleting}
       isSaving={isSaving}
       heardText={heardText}
       commandStatus={commandStatus}

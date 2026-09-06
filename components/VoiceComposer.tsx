@@ -10,6 +10,8 @@ interface VoiceComposerProps {
   subtitle: string;
   onCancel: () => void;
   onSave: () => void;
+  onDelete?: () => void;
+  isDeleting?: boolean;
   isSaving: boolean;
   heardText: string;
   commandStatus: CommandStatus | null;
@@ -27,6 +29,8 @@ export default function VoiceComposer({
   subtitle,
   onCancel,
   onSave,
+  onDelete,
+  isDeleting = false,
   isSaving,
   heardText,
   commandStatus,
@@ -64,6 +68,25 @@ export default function VoiceComposer({
             <Text style={styles.cancelText}>Cancel</Text>
           </Pressable>
           <SaveButton onPress={onSave} isSaving={isSaving} />
+          {onDelete ? (
+            <Pressable
+              onPress={onDelete}
+              disabled={isSaving || isDeleting}
+              accessibilityRole="button"
+              accessibilityLabel="Delete"
+              style={({ pressed }) => [
+                styles.deleteButton,
+                pressed && styles.deleteButtonPressed,
+                (isSaving || isDeleting) && styles.deleteButtonPressed,
+              ]}
+            >
+              {isDeleting ? (
+                <ActivityIndicator size="small" color="#D64545" />
+              ) : (
+                <Text style={styles.deleteText}>Delete</Text>
+              )}
+            </Pressable>
+          ) : null}
         </View>
       </View>
 

@@ -16,6 +16,7 @@ function applyOneAction(draft: CustomerDraft, action: CustomerAction): CustomerD
     case ActionName.CLEAR:
       return { ...emptyCustomerDraft };
     case ActionName.SAVE:
+    case ActionName.DELETE_CUSTOMER:
     case ActionName.UNKNOWN:
     case ActionName.INCOMPLETE:
       return null;
@@ -34,11 +35,19 @@ export function isSaveCustomerAction(response: CustomerAgentActionResponse): boo
   return response.length === 1 && response[0].action === ActionName.SAVE;
 }
 
+export function isDeleteCustomerAction(response: CustomerAgentActionResponse): boolean {
+  return response.length === 1 && response[0].action === ActionName.DELETE_CUSTOMER;
+}
+
 export function applyCustomerAction(
   draft: CustomerDraft,
   response: CustomerAgentActionResponse,
 ): CustomerDraft | null {
-  if (isIncompleteCustomerAction(response) || isUnknownCustomerAction(response)) {
+  if (
+    isIncompleteCustomerAction(response) ||
+    isUnknownCustomerAction(response) ||
+    isDeleteCustomerAction(response)
+  ) {
     return null;
   }
 
@@ -46,7 +55,7 @@ export function applyCustomerAction(
   let changed = false;
 
   for (const action of response) {
-    if (action.action === ActionName.SAVE) {
+    if (action.action === ActionName.SAVE || action.action === ActionName.DELETE_CUSTOMER) {
       continue;
     }
     const applied = applyOneAction(next, action);

@@ -13,12 +13,14 @@ export const ActionName = {
   SET_COMPANY: 'SET_COMPANY',
   CLEAR_INVOICE: 'CLEAR_INVOICE',
   SAVE_INVOICE: 'SAVE_INVOICE',
+  DELETE_INVOICE: 'DELETE_INVOICE',
   SET_NAME: 'SET_NAME',
   SET_BALANCE: 'SET_BALANCE',
   SET_COST: 'SET_COST',
   SET_SELLING: 'SET_SELLING',
   CLEAR: 'CLEAR',
   SAVE: 'SAVE',
+  DELETE_CUSTOMER: 'DELETE_CUSTOMER',
   UNKNOWN: 'UNKNOWN',
   INCOMPLETE: 'INCOMPLETE',
 } as const;
@@ -44,7 +46,7 @@ export const AddItemActionSchema = z
 export const DeleteItemActionSchema = z
   .object({
     action: z.literal(ActionName.DELETE_ITEM),
-    name: z.string(),
+    name: z.string().optional(),
   })
   .strict();
 
@@ -137,6 +139,12 @@ export const SaveInvoiceActionSchema = z
   })
   .strict();
 
+export const DeleteInvoiceActionSchema = z
+  .object({
+    action: z.literal(ActionName.DELETE_INVOICE),
+  })
+  .strict();
+
 export const UnknownActionSchema = z
   .object({
     action: z.literal(ActionName.UNKNOWN),
@@ -196,6 +204,13 @@ export const SaveActionSchema = z
   })
   .strict();
 
+export const DeleteCustomerActionSchema = z
+  .object({
+    action: z.literal(ActionName.DELETE_CUSTOMER),
+    name: z.string().optional(),
+  })
+  .strict();
+
 export const ActionSchema = z.union([
   AddItemActionSchema,
   DeleteItemActionSchema,
@@ -209,6 +224,7 @@ export const ActionSchema = z.union([
   SetCompanyActionSchema,
   ClearInvoiceActionSchema,
   SaveInvoiceActionSchema,
+  DeleteInvoiceActionSchema,
   UnknownActionSchema,
   IncompleteActionSchema,
 ]);
@@ -224,6 +240,7 @@ export const CustomerActionSchema = z.union([
   SetBalanceActionSchema,
   ClearActionSchema,
   SaveActionSchema,
+  DeleteCustomerActionSchema,
   UnknownActionSchema,
   IncompleteActionSchema,
 ]);

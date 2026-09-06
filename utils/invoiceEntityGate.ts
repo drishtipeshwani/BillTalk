@@ -6,6 +6,7 @@ import {
 import type { Invoice } from '../types/invoice';
 import {
   applySingleInvoiceAction,
+  currentInvoiceItemName,
   invoiceHasItem,
 } from './applyInvoiceAction';
 import { fuzzyMatchEntityName, normalizeEntityName } from './entityName';
@@ -144,8 +145,18 @@ export async function processGatedInvoiceActions(
 
   for (let index = 0; index < actions.length; index += 1) {
     let action = rewriteCompanyAsCustomer(actions[index]);
-    if (action.action === ActionName.SAVE_INVOICE) {
+    if (
+      action.action === ActionName.SAVE_INVOICE ||
+      action.action === ActionName.DELETE_INVOICE
+    ) {
       continue;
+    }
+
+    if (action.action === ActionName.DELETE_ITEM && !action.name?.trim()) {
+      const currentName = currentInvoiceItemName(next);
+      if (currentName) {
+        action = { ...action, name: currentName };
+      }
     }
 
     const requirement = catalogRequirement(next, action);
@@ -183,7 +194,7 @@ export async function processGatedInvoiceActions(
       action.action === ActionName.SET_QUANTITY ||
       action.action === ActionName.SET_ITEM_DISCOUNT
     ) {
-      const spoken = normalizeEntityName(action.name);
+      const spoken = normalizeEntityName(action.name ?? '');
       if (spoken) {
         const resolvedName = await resolveCatalogName(
           next,
